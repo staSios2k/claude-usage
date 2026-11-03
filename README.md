@@ -33,7 +33,7 @@ Everything is configured from the menu that opens when you click the menu bar it
 ## Install
 
 ```bash
-git clone https://github.com/<your-username>/claude-usage-bar.git
+git clone https://github.com/staSios2k/claude-usage-bar.git
 cd claude-usage-bar
 ./install.sh
 ```
