@@ -34,9 +34,10 @@ cat > "$APP/Contents/Info.plist" <<EOF
   <key>CFBundleName</key><string>ClaudeUsage</string>
   <key>CFBundleExecutable</key><string>ClaudeUsage</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.1</string>
+  <key>CFBundleShortVersionString</key><string>1.2</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Clicking a session dot switches Terminal or iTerm2 to the tab that session runs in.</string>
 </dict>
 </plist>
 EOF
@@ -64,6 +65,6 @@ EOF
 launchctl bootstrap "gui/$(id -u)" "$AGENT"
 
 echo ""
-echo "Done. Your limits are now in the menu bar and in the top-right corner of the desktop."
+echo "Done. Your limits and Claude session dots are now in the menu bar."
 echo "If macOS asks about access to \"Claude Code-credentials\", click \"Always Allow\"."
 echo "To uninstall: ./uninstall.sh"

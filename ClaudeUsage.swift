@@ -1,5 +1,6 @@
-// ClaudeUsage — Claude usage limits (5h session and weekly) in the macOS menu bar
-// and on the desktop, with an optional "keep the Mac awake while Claude works" mode.
+// ClaudeUsage — Claude usage limits (5h session and weekly) in the macOS menu bar,
+// live status dots for every running Claude Code session, and an optional
+// "keep the Mac awake while Claude works" mode.
 //
 // Security in a nutshell:
 //  • The only network request: GET https://api.anthropic.com/api/oauth/usage
@@ -8,10 +9,11 @@
 //    logged or refreshed by this app.
 //  • Keep-awake only looks at file MODIFICATION DATES in ~/.claude/projects,
 //    never at file contents.
+//  • Session dots read Claude Code's small per-process status files in
+//    ~/.claude/sessions (pid, name, folder, busy/waiting/idle), never transcripts.
 //  • No dependencies, no auto-updates, no telemetry.
 
 import AppKit
-import SwiftUI
 import IOKit.pwr_mgt
 
 // MARK: - Constants
@@ -24,6 +26,11 @@ let refreshChoices = [30, 60, 120]       // seconds, selectable in the menu
 let keepAwakeHold: TimeInterval = 300    // after activity is seen, stay awake for 5 min…
 let keepAwakeRecheck: TimeInterval = 240 // …but re-check after 4 min and extend or let go
 let idleCheckEvery: TimeInterval = 60    // while not holding, look for activity every minute
+
+let sessionPollEvery: TimeInterval = 1   // session dots: re-read ~/.claude/sessions every second
+let waitingSound = "Glass"               // macOS system sound played when a session needs input
+let recentlyFinishedFor: TimeInterval = 30 // after finishing a task, the dot is dark green for 30 s
+let waitingReshakeEvery: TimeInterval = 30 // a waiting dot shakes again every 30 s until you respond
 
 // MARK: - Settings (UserDefaults)
 
@@ -46,9 +53,13 @@ enum Settings {
         get { let v = d.integer(forKey: "refreshSeconds"); return refreshChoices.contains(v) ? v : 120 }
         set { d.set(newValue, forKey: "refreshSeconds") }
     }
-    static var showDesktopWidget: Bool {
-        get { d.object(forKey: "showDesktopWidget") as? Bool ?? true }
-        set { d.set(newValue, forKey: "showDesktopWidget") }
+    static var sessionDots: Bool {
+        get { d.object(forKey: "sessionDots") as? Bool ?? true }
+        set { d.set(newValue, forKey: "sessionDots") }
+    }
+    static var waitingAlert: Bool {
+        get { d.object(forKey: "waitingAlert") as? Bool ?? true }
+        set { d.set(newValue, forKey: "waitingAlert") }
     }
     static var resetClockInBar: Bool {
         get { d.object(forKey: "showResetClockInBar") as? Bool ?? true }
@@ -267,15 +278,45 @@ func level(_ p: Double?) -> Level {
 // MARK: - App state
 
 @MainActor
-final class Store: ObservableObject {
-    @Published var usage: Usage?
-    @Published var status: Status = .loading
-    @Published var lastUpdate: Date?
-    @Published var now = Date()      // changing this redraws the widget
+final class Store {
+    var usage: Usage?
+    var status: Status = .loading
+    var lastUpdate: Date?
+    var now = Date()                 // "now" for the countdowns, refreshed by the redraw timer
     var rateLimited = false
     private var busy = false
 
     nonisolated init() {}
+
+    // The last good reading is kept on disk, so a restart (or a rate-limited API) still shows
+    // numbers instead of nothing. They are marked ⚠︎ until the API answers again.
+    private let cacheKey = "cachedUsage"
+
+    var cacheAge: TimeInterval? {
+        (UserDefaults.standard.dictionary(forKey: cacheKey)?["at"] as? Double)
+            .map { Date().timeIntervalSince1970 - $0 }
+    }
+
+    func restoreCache() {
+        guard usage == nil, let c = UserDefaults.standard.dictionary(forKey: cacheKey) else { return }
+        func limit(_ key: String) -> Limit {
+            let reset = (c[key + "Reset"] as? Double).map { Date(timeIntervalSince1970: $0) }
+            // A window that has reset since then: the old percentage no longer means anything.
+            let expired = reset.map { $0 < Date() } ?? true
+            return Limit(percent: expired ? nil : c[key + "Percent"] as? Double, resetsAt: expired ? nil : reset)
+        }
+        usage = Usage(session: limit("session"), weekly: limit("weekly"))
+        lastUpdate = (c["at"] as? Double).map { Date(timeIntervalSince1970: $0) }
+    }
+
+    private func saveCache(_ u: Usage) {
+        var c: [String: Any] = ["at": Date().timeIntervalSince1970]
+        for (key, l) in [("session", u.session), ("weekly", u.weekly)] {
+            if let p = l.percent { c[key + "Percent"] = p }
+            if let r = l.resetsAt { c[key + "Reset"] = r.timeIntervalSince1970 }
+        }
+        UserDefaults.standard.set(c, forKey: cacheKey)
+    }
 
     func refresh() async {
         guard !busy else { return }
@@ -284,7 +325,9 @@ final class Store: ObservableObject {
         do {
             // Reading the token may wait for the Keychain prompt — keep it off the main thread.
             let token = try await Task.detached(priority: .utility) { try loadToken() }.value
-            usage = try await fetchUsage(token: token)
+            let fresh = try await fetchUsage(token: token)
+            usage = fresh
+            saveCache(fresh)
             status = .ok
             rateLimited = false
             lastUpdate = Date()
@@ -420,107 +463,390 @@ final class KeepAwake {
     }
 }
 
-// MARK: - Desktop widget (SwiftUI)
+// MARK: - Claude Code sessions (status dots)
 
-func swiftColor(_ l: Level) -> Color {
-    switch l {
-    case .normal: return .accentColor
-    case .warning: return .orange
-    case .critical: return .red
-    }
-}
+enum SessionState {
+    case working   // Claude is running a turn
+    case waiting   // Claude needs the user: a permission prompt, a question, a dialog
+    case idle      // the turn is over
 
-struct Bar: View {
-    let fraction: Double
-    let color: Color
-    var body: some View {
-        GeometryReader { g in
-            ZStack(alignment: .leading) {
-                Capsule().fill(Color.primary.opacity(0.12))
-                if fraction > 0 {
-                    Capsule().fill(color).frame(width: max(6, g.size.width * min(fraction, 1)))
-                }
-            }
+    var color: NSColor {
+        switch self {
+        case .working: return .systemGreen
+        case .waiting: return .systemOrange
+        case .idle:    return .systemGray
         }
-        .frame(height: 6)
     }
-}
-
-struct LimitRow: View {
-    let title: String
-    let limit: Limit?
-    let weekly: Bool
-    let now: Date
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(title).font(.system(size: 12, weight: .medium)).foregroundStyle(.secondary)
-                Spacer()
-                Text(pct(limit?.percent))
-                    .font(.system(size: 17, weight: .semibold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(level(limit?.percent) == .normal ? Color.primary : swiftColor(level(limit?.percent)))
-            }
-            Bar(fraction: (limit?.percent ?? 0) / 100, color: swiftColor(level(limit?.percent)))
-            HStack {
-                Text(L("reset za ", "resets in ") + timeLeft(limit?.resetsAt, now: now))
-                Spacer()
-                Text(resetClock(limit?.resetsAt, weekly: weekly))
-            }
-            .font(.system(size: 11).monospacedDigit())
-            .foregroundStyle(.secondary)
+    var label: String {
+        switch self {
+        case .working: return L("pracuje", "working")
+        case .waiting: return L("czeka na Ciebie", "needs your input")
+        case .idle:    return L("bezczynna", "idle")
         }
     }
 }
 
-struct WidgetView: View {
-    @ObservedObject var store: Store
+struct ClaudeSession {
+    let pid: pid_t
+    let id: String
+    let name: String
+    let cwd: String
+    let entrypoint: String   // "cli", "claude-vscode", "claude-desktop", …
+    let state: SessionState
+    let startedAt: Double    // seconds since 1970
+}
 
-    var footer: String {
-        if let m = store.status.message { return m }
-        if let t = store.lastUpdate { return L("Zaktualizowano ", "Updated ") + clockString(t) }
-        return L("Ładowanie…", "Loading…")
-    }
+/// Parent PID, start time and controlling terminal of a process (sysctl, no subprocess).
+/// nil = no such process.
+func processInfo(_ pid: pid_t) -> (ppid: pid_t, start: Double, tty: dev_t)? {
+    var info = kinfo_proc()
+    var size = MemoryLayout<kinfo_proc>.stride
+    var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+    guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+    let t = info.kp_proc.p_un.__p_starttime
+    return (info.kp_eproc.e_ppid, Double(t.tv_sec) + Double(t.tv_usec) / 1_000_000, info.kp_eproc.e_tdev)
+}
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Claude").font(.system(size: 13, weight: .semibold))
-            LimitRow(title: L("Sesja (5h)", "Session (5h)"), limit: store.usage?.session, weekly: false, now: store.now)
-            LimitRow(title: L("Tydzień", "Week"), limit: store.usage?.weekly, weekly: true, now: store.now)
-            Text(footer)
-                .font(.system(size: 10))
-                .foregroundStyle(store.status.message == nil ? Color.secondary : Color.orange)
-                .lineLimit(1)
+/// Every running Claude Code session on this Mac, oldest first (so dots don't jump around).
+/// Claude Code keeps one small JSON file per process in ~/.claude/sessions with its
+/// status: "busy", "waiting" (needs the user), "idle" or "shell" (idle, background shell running).
+func loadSessions() -> [ClaudeSession] {
+    let dir = claudeDir() + "/sessions"
+    guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return [] }
+    var out: [ClaudeSession] = []
+    for name in names where name.hasSuffix(".json") {
+        guard let data = FileManager.default.contents(atPath: dir + "/" + name),
+              let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let pid = (o["pid"] as? NSNumber)?.int32Value,
+              let id = o["sessionId"] as? String,
+              o["spare"] as? Bool != true          // pre-started process nobody uses yet
+        else { continue }
+        let startedAt = ((o["startedAt"] as? NSNumber)?.doubleValue ?? 0) / 1000
+        // Skip files left behind by a session that has exited (or whose PID now belongs
+        // to a newer process).
+        guard let p = processInfo(pid), startedAt == 0 || p.start <= startedAt + 5 else { continue }
+
+        let state: SessionState
+        switch o["status"] as? String {
+        case "busy":    state = .working
+        case "waiting": state = .waiting
+        default:        state = .idle
         }
-        .padding(14)
-        .frame(width: 240)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        let cwd = o["cwd"] as? String ?? ""
+        let title = (o["name"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? (cwd as NSString).lastPathComponent
+        out.append(ClaudeSession(pid: pid, id: id, name: title, cwd: cwd,
+                                 entrypoint: o["entrypoint"] as? String ?? "",
+                                 state: state, startedAt: startedAt))
+    }
+    return out.sorted { ($0.startedAt, $0.id) < ($1.startedAt, $1.id) }
+}
+
+/// The app a session runs in: the nearest regular (Dock) app among its parent processes,
+/// e.g. Terminal, iTerm2, Visual Studio Code or Claude.
+func hostApp(of pid: pid_t) -> NSRunningApplication? {
+    var p = pid
+    for _ in 0..<16 {
+        guard let info = processInfo(p), info.ppid > 1 else { return nil }
+        p = info.ppid
+        if let app = NSRunningApplication(processIdentifier: p), app.activationPolicy == .regular { return app }
+    }
+    return nil
+}
+
+/// First URL scheme an app registers ("vscode", "cursor", …).
+func urlScheme(of appURL: URL) -> String? {
+    guard let types = Bundle(url: appURL)?.object(forInfoDictionaryKey: "CFBundleURLTypes") as? [[String: Any]]
+    else { return nil }
+    return types.lazy.compactMap { ($0["CFBundleURLSchemes"] as? [String])?.first }.first
+}
+
+/// Brings the user to a session: the right editor window and Claude tab, or the right
+/// terminal tab. Falls back to just bringing its app to the front.
+@MainActor
+func focusSession(_ s: ClaudeSession) {
+    guard let app = hostApp(of: s.pid), let appURL = app.bundleURL else {
+        if s.entrypoint == "claude-desktop" {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/Claude.app"))
+        }
+        return
+    }
+    let activate = NSWorkspace.OpenConfiguration()
+    activate.activates = true
+
+    // VS Code (and forks): opening the folder focuses the window that has it open,
+    // then the Claude Code extension's own link reveals that session's tab.
+    if s.entrypoint == "claude-vscode", let scheme = urlScheme(of: appURL), !s.cwd.isEmpty,
+       let link = URL(string: "\(scheme)://anthropic.claude-code/open?session=\(s.id)") {
+        NSWorkspace.shared.open([URL(fileURLWithPath: s.cwd)], withApplicationAt: appURL, configuration: activate) { _, _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                let again = NSWorkspace.OpenConfiguration()
+                again.activates = true
+                NSWorkspace.shared.open([link], withApplicationAt: appURL, configuration: again)
+            }
+        }
+        return
+    }
+
+    // Terminal / iTerm2: select the tab whose tty the session runs on.
+    if let tty = processInfo(s.pid)?.tty, tty != -1, let dev = devname(tty, S_IFCHR) {
+        let path = "/dev/" + String(cString: dev)
+        var script: String?
+        switch app.bundleIdentifier {
+        case "com.apple.Terminal":
+            script = """
+            tell application "Terminal"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  if tty of t is "\(path)" then
+                    set selected of t to true
+                    set index of w to 1
+                  end if
+                end repeat
+              end repeat
+              activate
+            end tell
+            """
+        case "com.googlecode.iterm2":
+            script = """
+            tell application "iTerm2"
+              repeat with w in windows
+                repeat with t in tabs of w
+                  repeat with ss in sessions of t
+                    if tty of ss is "\(path)" then
+                      select w
+                      select t
+                      select ss
+                    end if
+                  end repeat
+                end repeat
+              end repeat
+              activate
+            end tell
+            """
+        default: break
+        }
+        if let script {
+            var err: NSDictionary?
+            NSAppleScript(source: script)?.executeAndReturnError(&err)
+            if err == nil { return }
+        }
+    }
+
+    NSWorkspace.shared.openApplication(at: appURL, configuration: activate)
+}
+
+/// The whole menu bar item in one view: one dot per session, then the usage text. Being a
+/// single item, the dots can never be separated from the usage text by other apps' icons.
+/// Every dot is clickable on its own; a click anywhere else opens the menu.
+/// A dot shakes to get attention when its session needs you or has just finished.
+final class SessionBarView: NSView, NSViewToolTipOwner {
+    static let dotSize: CGFloat = 10
+    static let cell: CGFloat = 16     // dot + 6 pt gap
+    static let pad: CGFloat = 6       // left/right edge; also room for the shake
+
+    final class Dot {
+        let layer = CALayer()
+        var session: ClaudeSession
+        var finishedAt: Date?         // when the session went from working to idle
+        var acknowledged = false      // clicked while waiting → stop nagging
+        var lastShake = Date.distantPast
+        init(_ s: ClaudeSession) {
+            session = s
+            layer.cornerRadius = SessionBarView.dotSize / 2
+        }
+    }
+
+    var onWidthChange: ((CGFloat) -> Void)?
+    var onDotClick: ((ClaudeSession) -> Void)?
+    var onTextClick: (() -> Void)?
+
+    private var dots: [Dot] = []      // display order: oldest session first
+    private var byID: [String: Dot] = [:]
+    private var text = NSAttributedString()
+    private var lastWidth: CGFloat = -1
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setText(_ t: NSAttributedString) {
+        text = t
+        needsDisplay = true
+        relayout()
+    }
+
+    /// Syncs the dots with the running sessions. Returns true if a session just started
+    /// waiting for the user (the caller plays the sound). `alerts` is false on the first read.
+    @discardableResult
+    func apply(_ list: [ClaudeSession], alerts: Bool) -> Bool {
+        let ids = Set(list.map(\.id))
+        for (id, dot) in byID where !ids.contains(id) {
+            dot.layer.removeFromSuperlayer()
+            byID[id] = nil
+        }
+        var startedWaiting = false
+        var ordered: [Dot] = []
+        for s in list {
+            guard let dot = byID[s.id] else {
+                let dot = Dot(s)
+                byID[s.id] = dot
+                layer?.addSublayer(dot.layer)
+                ordered.append(dot)
+                continue
+            }
+            let before = dot.session.state
+            if before == .working && s.state == .idle { dot.finishedAt = Date() }
+            else if s.state != .idle { dot.finishedAt = nil }
+            if s.state != .waiting { dot.acknowledged = false }
+            dot.session = s
+            ordered.append(dot)
+            guard alerts else { continue }
+            if s.state == .waiting && before != .waiting {
+                startedWaiting = true
+                shake(dot)
+            } else if s.state == .idle && before == .working {
+                shake(dot)                                     // finished its task
+            } else if s.state == .waiting, !dot.acknowledged,
+                      Date().timeIntervalSince(dot.lastShake) >= waitingReshakeEvery {
+                shake(dot)                                     // still waiting: keep nagging
+            }
+        }
+        dots = ordered
+        relayout()
+        return startedWaiting
+    }
+
+    private var dotsWidth: CGFloat { CGFloat(dots.count) * Self.cell }
+
+    private func color(_ d: Dot) -> NSColor {
+        // Just finished: dark green for a while, then grey.
+        if d.session.state == .idle, let f = d.finishedAt, Date().timeIntervalSince(f) < recentlyFinishedFor {
+            return NSColor.systemGreen.blended(withFraction: 0.45, of: .black) ?? .systemGreen
+        }
+        return d.session.state.color
+    }
+
+    private func relayout() {
+        let width = (Self.pad * 2 + dotsWidth + text.size().width).rounded(.up)
+        if width != lastWidth {
+            lastWidth = width
+            onWidthChange?(width)
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (i, d) in dots.enumerated() {
+            d.layer.frame = NSRect(x: Self.pad + CGFloat(i) * Self.cell,
+                                   y: ((bounds.height - Self.dotSize) / 2).rounded(),
+                                   width: Self.dotSize, height: Self.dotSize)
+            d.layer.backgroundColor = color(d).cgColor
+        }
+        CATransaction.commit()
+        removeAllToolTips()
+        for i in dots.indices { addToolTip(cell(i), owner: self, userData: nil) }
+    }
+
+    override func layout() {
+        super.layout()
+        relayout()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let size = text.size()
+        text.draw(at: NSPoint(x: Self.pad + dotsWidth, y: ((bounds.height - size.height) / 2).rounded()))
+    }
+
+    /// Clickable area of a dot: the full height, the dot plus its gap.
+    private func cell(_ i: Int) -> NSRect {
+        NSRect(x: Self.pad - 2 + CGFloat(i) * Self.cell, y: 0, width: Self.cell, height: bounds.height)
+    }
+
+    private func dotIndex(at p: NSPoint) -> Int? {
+        dots.indices.first { cell($0).contains(p) }
+    }
+
+    /// A hard side-to-side shake with a hop and a swell, twice. About 1.3 s.
+    private func shake(_ d: Dot) {
+        d.lastShake = Date()
+        let x = CAKeyframeAnimation(keyPath: "transform.translation.x")
+        x.values = [0, -4, 4, -4, 4, -3.5, 3.5, -2.5, 2.5, 0]
+        let y = CAKeyframeAnimation(keyPath: "transform.translation.y")   // the menu bar has room above and below
+        y.values = [0, 6, -1, 4, -1, 2, 0]
+        let scale = CAKeyframeAnimation(keyPath: "transform.scale")
+        scale.values = [1, 1.35, 1.1, 1.25, 1]
+        let group = CAAnimationGroup()
+        group.animations = [x, y, scale]
+        group.duration = 0.65
+        group.repeatCount = 2
+        d.layer.add(group, forKey: "shake")
+    }
+
+    /// Transparent to the mouse: the menu bar button receives the click (and calls its
+    /// action), and the action asks this view which dot, if any, was hit.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// `windowPoint` is the click location in the status item window's coordinates.
+    func click(atWindowPoint windowPoint: NSPoint) {
+        let p = convert(windowPoint, from: nil)
+        if let i = dotIndex(at: p) {
+            let d = dots[i]
+            d.acknowledged = true
+            d.layer.removeAllAnimations()
+            onDotClick?(d.session)
+        } else {
+            onTextClick?()
+        }
+    }
+
+    func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag, point: NSPoint,
+              userData data: UnsafeMutableRawPointer?) -> String {
+        guard let i = dotIndex(at: point) else { return "" }
+        let s = dots[i].session
+        return "\(s.name) — \(s.state.label)\n\((s.cwd as NSString).abbreviatingWithTildeInPath)"
     }
 }
 
-/// Lets the borderless widget be dragged by its background.
-final class DraggableHostingView<Content: View>: NSHostingView<Content> {
-    override var mouseDownCanMoveWindow: Bool { true }
-}
-
-// MARK: - Menu bar + desktop window (AppKit)
+// MARK: - Menu bar (AppKit)
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = Store()
     var statusItem: NSStatusItem!
-    var desktopWindow: NSWindow?
     var refreshTimer: Timer?
     var redrawTimer: Timer?
     var currentDelay: TimeInterval = 0
     var keepAwake: KeepAwake!
 
+    // Session dots live inside the same menu bar item, left of the usage text.
+    let barView = SessionBarView()
+    var sessionTimer: Timer?
+    var sessionsRead = false               // the first read is silent (no sound/shake at startup)
+    var readingSessions = false
+
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Leftovers from the desktop widget, which no longer exists.
+        UserDefaults.standard.removeObject(forKey: "showDesktopWidget")
+        UserDefaults.standard.removeObject(forKey: "NSWindow Frame ClaudeUsageDesktopWidget")
+        UserDefaults.standard.removeObject(forKey: "NSStatusItem VisibleCC ClaudeUsageSessionDots")
+
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = statusItem.button {
+            barView.frame = button.bounds
+            barView.autoresizingMask = [.width, .height]
+            button.addSubview(barView)
+        }
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(barClicked)
+        statusItem.button?.sendAction(on: [.leftMouseDown])
+        barView.onWidthChange = { self.statusItem.length = $0 }
+        barView.onDotClick = { focusSession($0) }
+        barView.onTextClick = { self.showMenu() }
         // The delegate lives as long as the app, so capturing self strongly is fine.
         keepAwake = KeepAwake(currentUsage: { self.store.usage }, onChange: { self.updateStatusItem() })
         updateStatusItem()
-        if Settings.showDesktopWidget { showDesktopWidget() }
+        setSessionDots(Settings.sessionDots)
 
         redrawTimer = Timer.scheduledTimer(withTimeInterval: redrawEvery, repeats: true) { _ in
             Task { @MainActor in self.redraw() }
@@ -532,8 +858,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in await self.refreshNow() }
         }
 
+        // Show the last known numbers right away. If they are fresh enough, don't ask the API
+        // again yet, so restarting the app never causes a rate limit.
+        store.restoreCache()
+        updateStatusItem()
         Task {
-            await refreshNow()
+            if let age = store.cacheAge, age >= 0, age < TimeInterval(Settings.refreshSeconds), store.usage != nil {
+                store.status = .ok
+                scheduleNextRefresh()
+            } else {
+                await refreshNow()
+            }
             if Settings.keepAwake { keepAwake.setEnabled(true) }
         }
     }
@@ -555,7 +890,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Redraws the menu bar and widget (e.g. after a language or clock-format change).
+    /// Redraws the menu bar (e.g. after a language or clock-format change).
     func redraw() {
         store.now = Date()
         updateStatusItem()
@@ -564,7 +899,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Menu bar text: "☕ 5h 42% (2h13m · 12:43) │ 7d 18% (3d4h · Thu, 21:00)"
     // ☕ = keeping the Mac awake; the part after "·" can be turned off in the menu.
     func updateStatusItem() {
-        guard let button = statusItem.button else { return }
         let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         let title = NSMutableAttributedString()
 
@@ -596,14 +930,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             add("Claude …")
         }
 
-        button.attributedTitle = title
-        statusItem.menu = buildMenu()
+        barView.setText(title)
     }
 
     func barTime(_ l: Limit, weekly: Bool) -> String {
         let left = timeLeft(l.resetsAt, now: store.now, compact: true)
         guard Settings.resetClockInBar, l.resetsAt != nil else { return left }
         return "\(left) · \(resetClock(l.resetsAt, weekly: weekly))"
+    }
+
+    // MARK: Session dots
+
+    func setSessionDots(_ on: Bool) {
+        sessionTimer?.invalidate()
+        sessionTimer = nil
+        barView.apply([], alerts: false)
+        sessionsRead = false
+        guard on else { return }
+        sessionTimer = Timer.scheduledTimer(withTimeInterval: sessionPollEvery, repeats: true) { _ in
+            Task { @MainActor in await self.pollSessions() }
+        }
+        Task { await pollSessions() }
+    }
+
+    func pollSessions() async {
+        guard !readingSessions else { return }
+        readingSessions = true
+        defer { readingSessions = false }
+        let list = await Task.detached(priority: .utility) { loadSessions() }.value
+        guard sessionTimer != nil else { return }   // turned off meanwhile
+        let startedWaiting = barView.apply(list, alerts: sessionsRead && Settings.waitingAlert)
+        if startedWaiting { NSSound(named: waitingSound)?.play() }
+        sessionsRead = true
+    }
+
+    @objc func barClicked() {
+        // Where the mouse is right now, in the status item window's coordinates. This does not
+        // depend on which window the event claims to belong to.
+        guard let window = statusItem.button?.window else { return showMenu() }
+        let p = window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        barView.click(atWindowPoint: p)
+    }
+
+    /// Opens the menu under the item (it is built now, so it is always current).
+    func showMenu() {
+        statusItem.menu = buildMenu()
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
     }
 
     // MARK: Menu
@@ -654,8 +1027,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(item(L("Odśwież teraz", "Refresh now"), #selector(refreshClicked), key: "r"))
         menu.addItem(item(L("Nie usypiaj Maca, gdy Claude pracuje", "Keep Mac awake while Claude works"),
                           #selector(toggleKeepAwake), on: Settings.keepAwake))
-        menu.addItem(item(L("Widget na pulpicie", "Desktop widget"), #selector(toggleDesktopWidget),
-                          on: Settings.showDesktopWidget))
+        menu.addItem(item(L("Kropki sesji Claude w pasku", "Claude session dots in menu bar"),
+                          #selector(toggleSessionDots), on: Settings.sessionDots))
+        let alert = item(L("Trzęsienie i dźwięk, gdy sesja czeka lub skończy", "Shake and sound when a session needs you or finishes"),
+                         #selector(toggleWaitingAlert), on: Settings.waitingAlert)
+        alert.isEnabled = Settings.sessionDots
+        alert.indentationLevel = 1
+        menu.addItem(alert)
         menu.addItem(item(L("Godzina resetu w pasku", "Reset time in menu bar"), #selector(toggleResetClock),
                           on: Settings.resetClockInBar))
 
@@ -714,40 +1092,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         redraw()
     }
 
-    @objc func toggleDesktopWidget() {
-        Settings.showDesktopWidget.toggle()
-        if Settings.showDesktopWidget { showDesktopWidget() } else { desktopWindow?.orderOut(nil) }
+    @objc func toggleSessionDots() {
+        Settings.sessionDots.toggle()
+        setSessionDots(Settings.sessionDots)
         redraw()
     }
 
-    // MARK: Desktop window
-
-    func showDesktopWidget() {
-        if let w = desktopWindow { w.orderFront(nil); return }
-
-        let host = DraggableHostingView(rootView: WidgetView(store: store))
-        let size = host.fittingSize
-        let w = NSWindow(contentRect: NSRect(origin: .zero, size: size),
-                         styleMask: [.borderless], backing: .buffered, defer: false)
-        w.contentView = host
-        w.isOpaque = false
-        w.backgroundColor = .clear
-        w.hasShadow = true
-        w.isMovableByWindowBackground = true
-        w.isReleasedWhenClosed = false
-        // Just above the desktop icons: the widget sits "on the desktop", below normal windows.
-        w.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
-        w.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
-
-        // Remember the position after dragging; first launch → top-right corner.
-        let name = "ClaudeUsageDesktopWidget"
-        if !w.setFrameUsingName(name), let screen = NSScreen.main?.visibleFrame {
-            w.setFrameOrigin(NSPoint(x: screen.maxX - size.width - 24, y: screen.maxY - size.height - 24))
-        }
-        w.setFrameAutosaveName(name)
-
-        w.orderFront(nil)
-        desktopWindow = w
+    @objc func toggleWaitingAlert() {
+        Settings.waitingAlert.toggle()
+        if Settings.waitingAlert { NSSound(named: waitingSound)?.play() }   // preview
+        redraw()
     }
 }
 
